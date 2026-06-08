@@ -1211,6 +1211,11 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         // and simply compiles assembly locally; we match that. Caching still
         // applies via the unchanged local command. Gating here in the shared C
         // path covers both gcc and clang (clang delegates to gcc's generator).
+        //
+        // (Note: `/dev/null` inputs -- kbuild's `gcc <flag> -c /dev/null` probes
+        // -- ARE distributed; they are packed as empty regular files in the
+        // inputs tar, see make_tar_header, so the build server's `docker cp`
+        // doesn't choke on a device node.)
         let dist_cmd = match self.parsed_args.language {
             Language::Assembler | Language::AssemblerToPreprocess => None,
             _ => dist_cmd,

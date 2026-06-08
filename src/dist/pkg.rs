@@ -410,6 +410,19 @@ pub fn make_tar_header(src: &Path, dest: &str) -> io::Result<tar::Header> {
     if let Ok(metadata) = metadata_res {
         // TODO: if the source file is a symlink, I think this does bad things
         file_header.set_metadata(&metadata);
+        // Everything we put in the inputs/toolchain tar is a stream of file
+        // CONTENT (preprocessed source, copied file bytes), never an actual
+        // special file. But set_metadata copies the source's entry type -- so a
+        // `/dev/null` input (kbuild's `gcc <flag> -c /dev/null` probes) would be
+        // recorded as a character device, and the build server's `docker cp`
+        // then fails "operation not permitted" trying to mknod it without
+        // CAP_MKNOD. Force a regular-file entry (and clear device numbers) so
+        // any special-file input is shipped as a plain file with its content.
+        if file_header.entry_type() != tar::EntryType::file() {
+            file_header.set_entry_type(tar::EntryType::file());
+            let _ = file_header.set_device_major(0);
+            let _ = file_header.set_device_minor(0);
+        }
     } else {
         warn!(
             "Couldn't get metadata of file {:?}, falling back to some defaults",
