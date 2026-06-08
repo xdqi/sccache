@@ -150,6 +150,8 @@ pub enum CCompilerKind {
     Gcc,
     /// clang
     Clang,
+    /// `zig cc` / `zig c++` (a clang driver; distributed with its own toolchain)
+    Zig,
     /// Diab
     Diab,
     /// Microsoft Visual C++
@@ -304,6 +306,13 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
     }
     #[cfg(feature = "dist-client")]
     fn get_toolchain_packager(&self) -> Box<dyn pkg::ToolchainPackager> {
+        // zig ships a driver binary + a whole lib/ tree (rustc-sysroot style),
+        // so it needs its own packager rather than the C/C++ ldd + per-tool one.
+        if self.compiler.kind() == CCompilerKind::Zig {
+            return Box::new(crate::compiler::zig::ZigToolchainPackager {
+                executable: self.executable.clone(),
+            });
+        }
         Box::new(CToolchainPackager {
             executable: self.executable.clone(),
             kind: self.compiler.kind(),
@@ -1246,10 +1255,18 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
             extra_dist_files: parsed_args.extra_dist_files,
             extra_hash_files: parsed_args.extra_hash_files,
         });
-        let toolchain_packager = Box::new(CToolchainPackager {
-            executable,
-            kind: compiler.kind(),
-        });
+        // zig needs its own toolchain packager (bundle the zig binary + the whole
+        // lib/ tree, rustc-style) rather than the C/C++ ldd + per-tool one, which
+        // would run gcc-style `-print-prog-name` probes zig rejects.
+        let toolchain_packager: Box<dyn pkg::ToolchainPackager> =
+            if compiler.kind() == CCompilerKind::Zig {
+                Box::new(crate::compiler::zig::ZigToolchainPackager { executable })
+            } else {
+                Box::new(CToolchainPackager {
+                    executable,
+                    kind: compiler.kind(),
+                })
+            };
         let outputs_rewriter = Box::new(NoopOutputsRewriter);
         Ok((inputs_packager, toolchain_packager, outputs_rewriter))
     }

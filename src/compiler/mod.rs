@@ -30,6 +30,7 @@ mod preprocessor_cache;
 mod ptxas;
 mod rust;
 mod tasking_vx;
+mod zig;
 #[macro_use]
 mod counted_array;
 

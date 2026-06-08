@@ -801,7 +801,7 @@ pub fn language_to_gcc_arg(lang: Language) -> Option<&'static str> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn preprocess_cmd<F, T>(
+pub fn preprocess_cmd<F, T>(
     cmd: &mut T,
     parsed_args: &ParsedArguments,
     cwd: &Path,

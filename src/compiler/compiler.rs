@@ -410,6 +410,7 @@ impl CompilerKind {
         let textual_lang = lang.as_str().to_owned();
         match self {
             CompilerKind::C(CCompilerKind::Clang) => textual_lang + " [clang]",
+            CompilerKind::C(CCompilerKind::Zig) => textual_lang + " [zig]",
             CompilerKind::C(CCompilerKind::Diab) => textual_lang + " [diab]",
             CompilerKind::C(CCompilerKind::Gcc) => textual_lang + " [gcc]",
             CompilerKind::C(CCompilerKind::Msvc) => textual_lang + " [msvc]",
@@ -1379,6 +1380,26 @@ fn is_nvidia_ptxas<P: AsRef<Path>>(p: P) -> bool {
 /// Returns true if the given path looks like a c compiler program
 ///
 /// This does not check c compilers, it only report programs that are definitely not rustc
+/// True if `p` is the zig driver (`zig` / `zig.exe`), invoked as `zig cc`/`zig c++`.
+fn is_zig<P: AsRef<Path>>(p: P) -> bool {
+    matches!(
+        p.as_ref()
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .as_deref(),
+        Some("zig")
+    )
+}
+
+/// The C/C++ zig subcommand if `args` start with one (`cc` or `c++`).
+fn zig_cc_subcommand(args: &[OsString]) -> Option<&'static str> {
+    match args.first().and_then(|a| a.to_str()) {
+        Some("cc") => Some("cc"),
+        Some("c++") => Some("c++"),
+        _ => None,
+    }
+}
+
 fn is_known_c_compiler<P: AsRef<Path>>(p: P) -> bool {
     matches!(
         p.as_ref()
@@ -1473,6 +1494,12 @@ where
         )
         .await
         .map(|c| (Box::new(c) as Box<dyn Compiler<T>>, None));
+    } else if is_zig(executable) && zig_cc_subcommand(args).is_some() {
+        // `zig cc` / `zig c++`: detect via the kept subcommand (the generic C
+        // detection would drop `cc` and run `zig -E`, which zig rejects).
+        let subcommand = zig_cc_subcommand(args).unwrap();
+        let zig = detect_zig(creator, executable, subcommand, env.to_vec(), pool).await;
+        return zig.map(|c| (c, None));
     } else if is_known_c_compiler(executable) {
         let cc = detect_c_compiler(creator, executable, args, env.to_vec(), pool).await;
         return cc.map(|c| (c, None));
@@ -1870,6 +1897,83 @@ compiler_version=__VERSION__
     debug!("compiler stderr:\n{}", stderr);
 
     bail!(stderr.into_owned())
+}
+
+/// Detect `zig cc` / `zig c++`. `executable` is the zig binary and `subcommand`
+/// is `cc` or `c++`. Probes `zig <subcommand> -E <test>` (which IS clang, so it
+/// reports `compiler_id=clang`) to grab the clang version, and `zig env` for the
+/// host target triple to pin `-target` on distributed compiles.
+#[allow(clippy::too_many_arguments)]
+async fn detect_zig<T>(
+    creator: T,
+    executable: &Path,
+    subcommand: &'static str,
+    env: Vec<(OsString, OsString)>,
+    pool: tokio::runtime::Handle,
+) -> Result<Box<dyn Compiler<T>>>
+where
+    T: CommandCreatorSync,
+{
+    // Minimal clang macro probe -- we only need to confirm clang and read the
+    // version. `zig <subcommand> -E testfile.c` keeps the subcommand (the generic
+    // detect_c_compiler would drop it and run `zig -E`, which zig rejects).
+    let test = b"
+#if defined(__clang__) && defined(__cplusplus)
+compiler_id=clang++
+#elif defined(__clang__)
+compiler_id=clang
+#else
+compiler_id=unknown
+#endif
+compiler_version=__VERSION__
+"
+    .to_vec();
+    let (tempdir, src) = write_temp_file(&pool, "testfile.c".as_ref(), test).await?;
+
+    let mut cmd = creator.clone().new_command_sync(executable);
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .envs(env.iter().map(|s| (&s.0, &s.1)))
+        .arg(subcommand)
+        .arg("-E")
+        .arg(&src);
+    let output = run_input_output(cmd, None).await?;
+    drop(tempdir);
+
+    let stdout = str::from_utf8(&output.stdout).context("Failed to parse zig probe output")?;
+    let mut lines = stdout.lines().filter_map(|line| {
+        let line = line.trim();
+        line.strip_prefix("compiler_id=")
+            .or_else(|| line.strip_prefix("compiler_version="))
+    });
+    let kind = lines.next();
+    if !matches!(kind, Some("clang") | Some("clang++")) {
+        bail!(
+            "`zig {} -E` did not report clang (got {:?}); stderr:\n{}",
+            subcommand,
+            kind,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let version = lines
+        .next()
+        .filter(|&line| line != "__VERSION__")
+        .map(str::to_owned);
+
+    debug!("Found zig {} (clang version {:?})", subcommand, version);
+    CCompiler::new(
+        crate::compiler::zig::Zig {
+            clang: Clang {
+                clangplusplus: subcommand == "c++",
+                is_appleclang: false,
+                version,
+            },
+        },
+        executable.to_owned(),
+        &pool,
+    )
+    .await
+    .map(|c| Box::new(c) as Box<dyn Compiler<T>>)
 }
 
 /// If `executable` is a known compiler, return a `Box<Compiler>` containing information about it.
