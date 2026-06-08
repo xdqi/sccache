@@ -55,6 +55,9 @@ impl CommandExt for Command {
             .take()
             .expect("Requested piped stdin but not present");
         pipe(&mut stdin).context("Failed to pipe input to process")?;
+        // Close our end so the child sees EOF; wait_with_output() can't, since
+        // the handle was taken out of `process` above.
+        drop(stdin);
         let output = process
             .wait_with_output()
             .context("Failed to wait for process to return")?;
