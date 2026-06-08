@@ -602,9 +602,26 @@ impl DockerBuilder {
     }
 
     fn clean_container(&self, cid: &str) -> Result<()> {
-        // Clean up any running processes
+        // Clean up any running processes left over from the compile, but NOT
+        // PID 1. The original `kill -9 -1` (kill every process but the caller)
+        // also kills the container's init loop (PID 1, the `sh -c "while true.."`
+        // started by start_container), which terminates the whole container.
+        // The dead container is then reclaimed into the pool, and the next job's
+        // `docker cp` into it fails "operation not permitted" -- which under a
+        // parallel `make -j` shows up as a stream of failed distributed
+        // compiles that fall back to local. Killing everything except PID 1
+        // keeps the container alive for reuse.
+        //
+        // busybox `kill` has no PID-exclude flag, so enumerate PIDs via ps and
+        // skip 1. The transient ps/sh/kill processes of this very command get
+        // their own short-lived PIDs; killing them is harmless (they exit anyway
+        // / kill tolerates already-gone PIDs), and PID 1 is explicitly spared.
+        let kill_others =
+            "for p in $(/busybox ps -o pid 2>/dev/null); do \
+                [ \"$p\" != 1 ] && [ \"$p\" -gt 0 ] 2>/dev/null && /busybox kill -9 \"$p\" 2>/dev/null; \
+             done; /busybox true";
         Command::new("docker")
-            .args(["exec", cid, "/busybox", "kill", "-9", "-1"])
+            .args(["exec", cid, "/busybox", "sh", "-c", kill_others])
             .check_run()
             .context("Failed to run kill on all processes in container")?;
 
@@ -696,10 +713,23 @@ impl DockerBuilder {
     }
 
     fn make_image(tc: &Toolchain, tccache: &Mutex<TcCache>) -> Result<String> {
+        // Start the base container RUNNING (init loop) rather than merely
+        // `docker create`-ing it. Streaming a large tar via `docker cp -` into a
+        // never-started ("Created" state) container hangs on modern
+        // docker/containerd (observed wedging Docker 29.5 indefinitely). Copying
+        // into a running container is the reliable path; we stop it before commit.
         let cid = Command::new("docker")
-            .args(["create", BASE_DOCKER_IMAGE, "/busybox", "true"])
+            .args([
+                "run",
+                "-d",
+                BASE_DOCKER_IMAGE,
+                "/busybox",
+                "sh",
+                "-c",
+                DOCKER_SHELL_INIT,
+            ])
             .check_stdout_trim()
-            .context("Failed to create docker container")?;
+            .context("Failed to start docker container")?;
 
         let mut tccache = tccache.lock().unwrap();
         let mut toolchain_rdr = match tccache.get(tc) {
@@ -715,14 +745,43 @@ impl DockerBuilder {
         };
 
         trace!("Copying in toolchain");
-        Command::new("docker")
-            .args(["cp", "-", &format!("{}:/", cid)])
-            .check_piped(&mut |stdin| {
-                io::copy(&mut toolchain_rdr, stdin)?;
-                Ok(())
-            })
-            .context("Failed to copy toolchain tar into container")?;
+        // `docker cp - <cid>:/` reads a tar from stdin and extracts it into the
+        // container root (a plain `docker cp <file>` would NOT extract -- it
+        // copies the tar as a file). We must therefore stream via stdin, but the
+        // original check_piped() deadlocks: it writes the whole multi-MB
+        // toolchain into the child's stdin while its stdout/stderr (inherited)
+        // are never drained, so once the OS pipe buffer fills both sides block
+        // forever (observed wedging the docker daemon on Docker 29.x).
+        //
+        // Fix: spool the toolchain to a temp file, hand that file to the child
+        // as stdin (Stdio::from(File)), and capture stdout/stderr via output()
+        // which drains them concurrently with the kernel feeding stdin. No pipe
+        // we own can fill, so no deadlock; the container still receives the
+        // extracted tar exactly as before.
+        let mut tc_tmp =
+            tempfile::NamedTempFile::new().context("Failed to create toolchain temp file")?;
+        io::copy(&mut toolchain_rdr, &mut tc_tmp)
+            .context("Failed to spool toolchain to temp file")?;
         drop(toolchain_rdr);
+        let tc_file = tc_tmp
+            .reopen()
+            .context("Failed to reopen toolchain temp file for stdin")?;
+        let cp_output = Command::new("docker")
+            .args(["cp", "-", &format!("{}:/", cid)])
+            .stdin(Stdio::from(tc_file))
+            .output()
+            .context("Failed to run docker cp for toolchain")?;
+        check_output(&cp_output).context("Failed to copy toolchain tar into container")?;
+        drop(tc_tmp);
+
+        // Stop the container before committing. Committing a *running* container
+        // can capture a transient filesystem layer; concurrent start_container
+        // calls (a `make -j` cold-start fires N jobs at once, all racing to the
+        // freshly-committed image) then `docker cp` into containers whose layer
+        // is still settling and get "operation not permitted". Stopping first
+        // gives a clean, fully-flushed layer that's safe for concurrent reuse.
+        // Best-effort: ignore stop errors (already-stopped is fine).
+        let _ = Command::new("docker").args(["stop", "-t", "1", &cid]).output();
 
         let imagename = format!("sccache-builder-{}", &tc.archive_id);
         Command::new("docker")
@@ -766,14 +825,27 @@ impl DockerBuilder {
         );
 
         trace!("copying in inputs");
-        Command::new("docker")
-            .args(["cp", "-", &format!("{}:/", cid)])
-            .check_piped(&mut |stdin| {
-                io::copy(&mut inputs_rdr, stdin)?;
-                Ok(())
-            })
-            .context("Failed to copy inputs tar into container")?;
+        // Same stdin-pipe deadlock fix as make_image: spool the inputs tar to a
+        // temp file and feed it as the child's stdin via Stdio::from(File), with
+        // stdout/stderr captured by output() (drained concurrently). The
+        // original check_piped() writes stdin while never draining the child's
+        // output, which can wedge `docker cp -` on Docker 29.x even for small
+        // inputs. `docker cp - <cid>:/` still extracts the tar into the root.
+        let mut inputs_tmp =
+            tempfile::NamedTempFile::new().context("Failed to create inputs temp file")?;
+        io::copy(&mut inputs_rdr, &mut inputs_tmp)
+            .context("Failed to spool inputs to temp file")?;
         drop(inputs_rdr);
+        let inputs_file = inputs_tmp
+            .reopen()
+            .context("Failed to reopen inputs temp file for stdin")?;
+        let cp_output = Command::new("docker")
+            .args(["cp", "-", &format!("{}:/", cid)])
+            .stdin(Stdio::from(inputs_file))
+            .output()
+            .context("Failed to run docker cp for inputs")?;
+        check_output(&cp_output).context("Failed to copy inputs tar into container")?;
+        drop(inputs_tmp);
 
         let CompileCommand {
             executable,
