@@ -1196,14 +1196,26 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         Option<dist::CompileCommand>,
         Cacheable,
     )> {
-        self.compiler.generate_compile_commands(
+        let (local_cmd, dist_cmd, cacheable) = self.compiler.generate_compile_commands(
             path_transformer,
             &self.executable,
             &self.parsed_args,
             &self.cwd,
             &self.env_vars,
             rewrite_includes_only,
-        )
+        )?;
+        // Never distribute assembly. The assembler resolves `.incbin`/`.include`
+        // operands against files that are not part of the shipped inputs (e.g.
+        // arch/x86/realmode/rmpiggy.S incbin's a generated realmode.bin), so a
+        // remote build fails "file not found". distcc has the same constraint
+        // and simply compiles assembly locally; we match that. Caching still
+        // applies via the unchanged local command. Gating here in the shared C
+        // path covers both gcc and clang (clang delegates to gcc's generator).
+        let dist_cmd = match self.parsed_args.language {
+            Language::Assembler | Language::AssemblerToPreprocess => None,
+            _ => dist_cmd,
+        };
+        Ok((local_cmd, dist_cmd, cacheable))
     }
 
     #[cfg(feature = "dist-client")]
