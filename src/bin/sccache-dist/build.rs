@@ -261,8 +261,11 @@ impl OverlayBuilder {
         output_paths: Vec<String>,
         overlay: &OverlaySpec,
     ) -> Result<BuildResult> {
-        trace!("Compile environment: {:?}", compile_command.env_vars);
-        trace!(
+        // See the DockerBuilder::perform_build note: the `sccache_compile` target
+        // isolates the real compile work (argv, env, bwrap command line, output)
+        // so `SCCACHE_LOG=sccache_compile=trace` shows only that.
+        trace!(target: "sccache_compile", "Compile environment: {:?}", compile_command.env_vars);
+        trace!(target: "sccache_compile",
             "Compile command: {:?} {:?}",
             compile_command.executable, compile_command.arguments
         );
@@ -380,10 +383,12 @@ impl OverlayBuilder {
                     cmd.arg("--");
                     cmd.arg(executable);
                     cmd.args(arguments);
+                    // The fully-assembled bwrap command line actually executed.
+                    trace!(target: "sccache_compile", "bwrap command: {:?}", cmd);
                     let compile_output = cmd
                         .output()
                         .context("Failed to retrieve output from compile")?;
-                    trace!("compile_output: {:?}", compile_output);
+                    trace!(target: "sccache_compile", "compile_output: {:?}", compile_output);
 
                     let mut outputs = vec![];
                     trace!("retrieving {:?}", output_paths);
@@ -818,8 +823,13 @@ impl DockerBuilder {
         output_paths: Vec<String>,
         cid: &str,
     ) -> Result<BuildResult> {
-        trace!("Compile environment: {:?}", compile_command.env_vars);
-        trace!(
+        // The `sccache_compile` log target carries the actual work a worker
+        // performs: the compiler argv, its environment, the exact `docker exec`
+        // command line, and the compiler's output. Scope it on its own target so
+        // `SCCACHE_LOG=sccache_compile=trace` surfaces only that — without the
+        // crate's HTTP/toolchain/container-lifecycle noise.
+        trace!(target: "sccache_compile", "Compile environment: {:?}", compile_command.env_vars);
+        trace!(target: "sccache_compile",
             "Compile command: {:?} {:?}",
             compile_command.executable, compile_command.arguments
         );
@@ -891,8 +901,11 @@ impl DockerBuilder {
         cmd.arg(cwd);
         cmd.arg(executable);
         cmd.args(arguments);
+        // Log the fully-assembled `docker exec ...` command line actually run in
+        // the container (the std::process::Command Debug shows program + argv).
+        trace!(target: "sccache_compile", "docker exec command: {:?}", cmd);
         let compile_output = cmd.output().context("Failed to start executing compile")?;
-        trace!("compile_output: {:?}", compile_output);
+        trace!(target: "sccache_compile", "compile_output: {:?}", compile_output);
 
         let mut outputs = vec![];
         trace!("retrieving {:?}", output_paths);
