@@ -920,6 +920,35 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Lexically simplify `.` and mid-path `..` components in the input path for
+/// the dist command line. The inputs packager stores the file at the lexically
+/// simplified path (`pkg::simplify_path` of the absolute input), so an argv
+/// path like `dummy/../src/t.c` references a `dummy/` directory that does not
+/// exist in the job dir on the build server and resolution fails with ENOENT
+/// even though the file content sits right at `src/t.c` (seen in the wild:
+/// gcc's libgcov objects are compiled as `gcc/../libgcc/libgcov-util.c`).
+/// Leading `..` components are kept as-is: they resolve through the job cwd's
+/// parent chain, which always exists on the server, and keeping them preserves
+/// the relative argv form for everything that already worked.
+#[cfg(feature = "dist-client")]
+fn lexically_simplify_input(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component<'_>> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                _ => out.push(c),
+            },
+            other => out.push(other),
+        }
+    }
+    out.iter().map(|c| c.as_os_str()).collect()
+}
+
 pub fn generate_compile_commands<F>(
     path_transformer: &mut dist::PathTransformer,
     executable: &Path,
@@ -1017,7 +1046,7 @@ where
             }
             arguments.extend(vec![
                 parsed_args.compilation_flag.clone().into_string().ok()?,
-                path_transformer.as_dist(&parsed_args.input)?,
+                path_transformer.as_dist(&lexically_simplify_input(&parsed_args.input))?,
                 "-o".into(),
                 path_transformer.as_dist(out_file)?,
             ]);
@@ -2415,6 +2444,85 @@ mod test {
         assert_eq!(Cacheable::Yes, cacheable);
         // Ensure that we ran all processes.
         assert_eq!(0, creator.lock().unwrap().children.len());
+    }
+
+    /// Mid-path `..` components must be lexically simplified in the dist argv
+    /// (the inputs packager stores the file at the simplified path, so the
+    /// unsimplified form is unresolvable in the job dir on the build server).
+    /// Leading `..` must be preserved.
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_lexically_simplify_input() {
+        let s = |p: &str| lexically_simplify_input(Path::new(p));
+        assert_eq!(s("dummy/../src/t.c"), Path::new("src/t.c"));
+        assert_eq!(
+            s("../../gcc-16.1.0/gcc/../libgcc/libgcov-util.c"),
+            Path::new("../../gcc-16.1.0/libgcc/libgcov-util.c")
+        );
+        assert_eq!(s("../src/t.c"), Path::new("../src/t.c"));
+        assert_eq!(s("./src/./t.c"), Path::new("src/t.c"));
+        assert_eq!(s("src/t.c"), Path::new("src/t.c"));
+        assert_eq!(s("a/b/../../c/t.c"), Path::new("c/t.c"));
+        assert_eq!(s("a/../../t.c"), Path::new("../t.c"));
+        assert_eq!(s("/abs/dummy/../src/t.c"), Path::new("/abs/src/t.c"));
+    }
+
+    #[test]
+    #[cfg(feature = "dist-client")]
+    fn test_compile_dist_input_simplified() {
+        let f = TestFixture::new();
+        let parsed_args = ParsedArguments {
+            input: "dummy/../src/foo.c".into(),
+            double_dash_input: false,
+            language: Language::C,
+            compilation_flag: "-c".into(),
+            depfile: None,
+            outputs: vec![(
+                "obj",
+                ArtifactDescriptor {
+                    path: "foo.o".into(),
+                    optional: false,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            dependency_args: vec![],
+            preprocessor_args: vec![],
+            common_args: vec![],
+            arch_args: vec![],
+            unhashed_args: vec![],
+            extra_dist_files: vec![],
+            extra_hash_files: vec![],
+            msvc_show_includes: false,
+            profile_generate: false,
+            color_mode: ColorMode::Auto,
+            suppress_rewrite_includes_only: false,
+            too_hard_for_preprocessor_cache_mode: None,
+        };
+        let compiler = &f.bins[0];
+        let mut path_transformer = dist::PathTransformer::new();
+        let (_command, dist_command, _cacheable) = generate_compile_commands(
+            &mut path_transformer,
+            compiler,
+            &parsed_args,
+            f.tempdir.path(),
+            &[],
+            CCompilerKind::Gcc,
+            false,
+            language_to_gcc_arg,
+        )
+        .unwrap();
+        let dist_command = dist_command.unwrap();
+        assert!(
+            dist_command.arguments.contains(&"src/foo.c".to_string()),
+            "dist argv must reference the simplified input path: {:?}",
+            dist_command.arguments
+        );
+        assert!(
+            !dist_command.arguments.iter().any(|a| a.contains("dummy")),
+            "dist argv must not reference the `..`-traversed directory: {:?}",
+            dist_command.arguments
+        );
     }
 
     #[test]
