@@ -25,9 +25,10 @@
 //!     first argument (zig dispatches on argv[1]; there is no argv0 multicall).
 //!   - Two non-transparent tweaks vs clang, both verified empirically:
 //!       * prepend the `cc`/`c++` subcommand to the argument list;
-//!       * strip the `-x <*-cpp-output>` language pair, since `zig cc` rejects
-//!         those language names (only `-x c` or the `.i` extension work); the
-//!         `.i` extension drives the language instead.
+//!       * rewrite the `-x <*-cpp-output>` language pair to the base language
+//!         (`-x c++-cpp-output` -> `-x c++`), since `zig cc` rejects the
+//!         `*-cpp-output` names but the language must stay explicit (the input
+//!         extension can disagree, e.g. `.c` files compiled as C++).
 //!   - Like rustc, inject an explicit host `-target` when the user gave none, so
 //!     the remote (possibly different-default) zig produces host-compatible
 //!     objects.
@@ -71,9 +72,26 @@ fn is_cpp_output_lang(arg: &str) -> bool {
     arg.ends_with("cpp-output")
 }
 
+/// Map a `*-cpp-output` language name to the base language zig accepts:
+/// `cpp-output` -> `c`, `c++-cpp-output` -> `c++`, etc. The language pair must
+/// be REWRITTEN, not dropped: dropping it hands language selection to the input
+/// file's extension, which is wrong whenever they disagree -- gcc's libgcov
+/// objects are `.c` files explicitly compiled as C++ (`-x c++`), so the worker
+/// compiled C++-preprocessed content as C and died on `extern "C"`/`namespace`
+/// (msys2-cross run 27257400910). zig happily re-preprocesses the already-
+/// preprocessed input under the base language (line markers are handled; the
+/// `-Wno-gnu-line-marker` below keeps -pedantic builds quiet).
+fn cpp_output_to_base_lang(lang: &str) -> String {
+    match lang.strip_suffix("-cpp-output") {
+        Some(base) if !base.is_empty() => base.to_string(),
+        // Plain "cpp-output" is preprocessed C.
+        _ => "c".to_string(),
+    }
+}
+
 /// Rewrite the dist command's flat `String` argument vector for zig:
-///   1. drop any `-x <*-cpp-output>` pair (zig rejects those names; the `.i`
-///      extension carries the language),
+///   1. rewrite any `-x <*-cpp-output>` pair to the base language (zig rejects
+///      the `*-cpp-output` names),
 ///   2. silence `-Wgnu-line-marker` on the locally-preprocessed input,
 ///   3. prepend the `cc`/`c++` subcommand.
 ///
@@ -87,10 +105,15 @@ fn rewrite_dist_arguments(subcommand: &str, arguments: Vec<String>) -> Vec<Strin
     let mut it = arguments.into_iter().peekable();
     while let Some(arg) = it.next() {
         if arg == "-x" {
-            // Peek the language operand; drop the pair if it's *-cpp-output.
+            // Peek the language operand; rewrite *-cpp-output to the base
+            // language (zig rejects the *-cpp-output names, but the language
+            // must stay explicit -- see cpp_output_to_base_lang).
             if let Some(next) = it.peek() {
                 if is_cpp_output_lang(next) {
-                    let _ = it.next(); // consume the language name
+                    let lang = cpp_output_to_base_lang(next);
+                    let _ = it.next(); // consume the original language name
+                    out.push(arg);
+                    out.push(lang);
                     continue;
                 }
             }
@@ -254,6 +277,46 @@ impl CCompilerImpl for Zig {
         });
 
         Ok((CCompileCommand::new(local_cmd), dist_cmd, cacheable))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// `-x <*-cpp-output>` pairs must be REWRITTEN to the base language, not
+    /// dropped: gcc's libgcov objects are `.c` files compiled as C++, so
+    /// extension-driven language selection compiles C++-preprocessed content
+    /// as C on the worker.
+    #[test]
+    fn test_rewrite_dist_arguments_x_lang() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let out = rewrite_dist_arguments("c++", args(&["-x", "c++-cpp-output", "-c", "a.c"]));
+        assert_eq!(out[0], "c++"); // subcommand prepended
+        let xpos = out.iter().position(|a| a == "-x").unwrap();
+        assert_eq!(out[xpos + 1], "c++");
+        assert!(out.contains(&"-Wno-gnu-line-marker".to_string()));
+
+        // Preprocessed C maps back to plain c.
+        let out = rewrite_dist_arguments("cc", args(&["-x", "cpp-output", "-c", "a.c"]));
+        let xpos = out.iter().position(|a| a == "-x").unwrap();
+        assert_eq!(out[xpos + 1], "c");
+
+        // Non-cpp-output -x pairs pass through untouched.
+        let out = rewrite_dist_arguments("cc", args(&["-x", "c", "-c", "a.i"]));
+        let xpos = out.iter().position(|a| a == "-x").unwrap();
+        assert_eq!(out[xpos + 1], "c");
+    }
+
+    #[test]
+    fn test_cpp_output_to_base_lang() {
+        assert_eq!(cpp_output_to_base_lang("c++-cpp-output"), "c++");
+        assert_eq!(cpp_output_to_base_lang("cpp-output"), "c");
+        assert_eq!(
+            cpp_output_to_base_lang("objective-c++-cpp-output"),
+            "objective-c++"
+        );
     }
 }
 
