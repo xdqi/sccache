@@ -1381,7 +1381,7 @@ fn is_nvidia_ptxas<P: AsRef<Path>>(p: P) -> bool {
 ///
 /// This does not check c compilers, it only report programs that are definitely not rustc
 /// True if `p` is the zig driver (`zig` / `zig.exe`), invoked as `zig cc`/`zig c++`.
-fn is_zig<P: AsRef<Path>>(p: P) -> bool {
+pub(crate) fn is_zig<P: AsRef<Path>>(p: P) -> bool {
     matches!(
         p.as_ref()
             .file_stem()
@@ -1392,7 +1392,7 @@ fn is_zig<P: AsRef<Path>>(p: P) -> bool {
 }
 
 /// The C/C++ zig subcommand if `args` start with one (`cc` or `c++`).
-fn zig_cc_subcommand(args: &[OsString]) -> Option<&'static str> {
+pub(crate) fn zig_cc_subcommand(args: &[OsString]) -> Option<&'static str> {
     match args.first().and_then(|a| a.to_str()) {
         Some("cc") => Some("cc"),
         Some("c++") => Some("c++"),

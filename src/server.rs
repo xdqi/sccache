@@ -16,7 +16,7 @@ use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
 use crate::compiler::{
     CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
-    CompilerProxy, DistType, Language, MissType, get_compiler_info,
+    CompilerProxy, DistType, Language, MissType, get_compiler_info, is_zig, zig_cc_subcommand,
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
@@ -50,7 +50,7 @@ use std::mem;
 use std::os::android::net::SocketAddrExt;
 #[cfg(target_os = "linux")]
 use std::os::linux::net::SocketAddrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{ExitStatus, Output};
 use std::sync::Arc;
@@ -1133,6 +1133,8 @@ where
             _ => resolved_compiler_path,
         };
 
+        let cache_key_path = compiler_cache_key(&resolved_compiler_path, args);
+
         let dist_info = match me1.dist_client.get_client().await {
             Ok(Some(ref client)) => {
                 if let Some(archive) = client.get_custom_toolchain(&resolved_compiler_path) {
@@ -1149,7 +1151,7 @@ where
             _ => None,
         };
 
-        let opt = match me1.compilers.read().await.get(&resolved_compiler_path) {
+        let opt = match me1.compilers.read().await.get(&cache_key_path) {
             // It's a hit only if the mtime and dist archive data matches.
             Some(Some(entry)) => {
                 if entry.mtime == mtime && entry.dist_info == dist_info {
@@ -1215,12 +1217,12 @@ where
                 let map_info = CompilerCacheEntry::new(c.clone(), mtime, dist_info);
                 trace!(
                     "Inserting POSSIBLY PROXIED cache map info for {:?}",
-                    &resolved_compiler_path
+                    &cache_key_path
                 );
                 me.compilers
                     .write()
                     .await
-                    .insert(resolved_compiler_path, Some(map_info));
+                    .insert(cache_key_path, Some(map_info));
 
                 // drop the proxy information, response is compiler only
                 Ok(c)
@@ -2278,9 +2280,58 @@ fn waits_until_zero() {
     assert_eq!(wait.now_or_never(), Some(()));
 }
 
+/// The key under which a compiler's info is cached in the server's compiler
+/// map.
+///
+/// The map is keyed by the resolved executable path. That works for clang vs
+/// clang++ (distinct paths, distinct keys), but `zig cc` and `zig c++` are the
+/// SAME binary dispatched by argv[1] -- the same path. Without disambiguation
+/// the first-seen subcommand seeds the entry and the other silently inherits
+/// its kind/plusplus/language; e.g. after a `zig cc` compile, a `zig c++` TU is
+/// preprocessed as `zig cc`, which does not add the libc++ include paths, and
+/// every C++ compile fails with `'memory' file not found`. Fold the zig
+/// subcommand into the cache key so the two get independent entries. The key is
+/// only a HashMap lookup, never opened as a file, so an in-name `#zig-cc` /
+/// `#zig-c++` suffix is safe.
+fn compiler_cache_key(resolved_compiler_path: &Path, args: &[OsString]) -> PathBuf {
+    if is_zig(resolved_compiler_path) {
+        if let Some(subcmd) = zig_cc_subcommand(args) {
+            let mut keyed = resolved_compiler_path.to_path_buf().into_os_string();
+            keyed.push("#zig-");
+            keyed.push(subcmd);
+            return PathBuf::from(keyed);
+        }
+    }
+    resolved_compiler_path.to_path_buf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `zig cc` and `zig c++` share one executable path; the compiler-info
+    /// cache key must distinguish them or the second-seen subcommand inherits
+    /// the first's identity (real-world symptom: C++ TUs preprocessed as
+    /// `zig cc` fail with `'memory' file not found`).
+    #[test]
+    fn test_compiler_cache_key_zig_subcommands() {
+        let zig = Path::new("/opt/zig/zig");
+        let cc_args = [OsString::from("cc"), OsString::from("-c")];
+        let cxx_args = [OsString::from("c++"), OsString::from("-c")];
+        let cc_key = compiler_cache_key(zig, &cc_args);
+        let cxx_key = compiler_cache_key(zig, &cxx_args);
+        assert_ne!(cc_key, cxx_key);
+        assert_eq!(cc_key, PathBuf::from("/opt/zig/zig#zig-cc"));
+        assert_eq!(cxx_key, PathBuf::from("/opt/zig/zig#zig-c++"));
+
+        // `zig build-exe` etc. are not the cc/c++ driver: plain path key.
+        let other_args = [OsString::from("build-exe")];
+        assert_eq!(compiler_cache_key(zig, &other_args), PathBuf::from(zig));
+
+        // Non-zig compilers keep the plain path key regardless of args.
+        let clang = Path::new("/usr/bin/clang++");
+        assert_eq!(compiler_cache_key(clang, &cxx_args), PathBuf::from(clang));
+    }
 
     struct StringWriter {
         buffer: String,
