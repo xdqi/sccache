@@ -442,9 +442,16 @@ impl SchedulerIncoming for Scheduler {
             let mut servers = self.servers.lock().unwrap();
 
             let res = {
-                let mut best = None;
-                let mut best_err = None;
+                // Ties at the minimum load are the common case (a build's
+                // parallelism is usually below farm capacity, so several
+                // servers sit at load zero). HashMap iteration order is fixed
+                // for the life of the process, so resolving ties to the first
+                // server scanned starves everything later in the scan order.
+                // Collect every server at the minimum load and pick one at
+                // random instead.
+                let mut candidates: Vec<ServerId> = Vec::new();
                 let mut best_load: f64 = MAX_PER_CORE_LOAD;
+                let mut best_err: Option<(ServerId, Instant)> = None;
                 let now = Instant::now();
                 for (&server_id, details) in servers.iter_mut() {
                     let load = load_weight(details.jobs_assigned.len(), details.num_cpus);
@@ -454,45 +461,47 @@ impl SchedulerIncoming for Scheduler {
                             if now.duration_since(last_error) > SERVER_REMEMBER_ERROR_TIMEOUT {
                                 details.last_error = None;
                             }
-                            match best_err {
-                                Some((
-                                    _,
-                                    &mut ServerDetails {
-                                        last_error: Some(best_last_err),
-                                        ..
-                                    },
-                                )) => {
-                                    if last_error < best_last_err {
-                                        trace!(
-                                            "Selected {:?}, its most recent error is {:?} ago",
-                                            server_id,
-                                            now - last_error
-                                        );
-                                        best_err = Some((server_id, details));
-                                    }
-                                }
-                                _ => {
-                                    trace!(
-                                        "Selected {:?}, its most recent error is {:?} ago",
-                                        server_id,
-                                        now - last_error
-                                    );
-                                    best_err = Some((server_id, details));
-                                }
+                            let replace = match best_err {
+                                Some((_, best_last_err)) => last_error < best_last_err,
+                                None => true,
+                            };
+                            if replace {
+                                trace!(
+                                    "Selected {:?}, its most recent error is {:?} ago",
+                                    server_id,
+                                    now - last_error
+                                );
+                                best_err = Some((server_id, last_error));
                             }
                         }
                     } else if load < best_load {
-                        best = Some((server_id, details));
-                        trace!("Selected {:?} as the server with the best load", server_id);
                         best_load = load;
-                        if load == 0f64 {
-                            break;
-                        }
+                        candidates.clear();
+                        candidates.push(server_id);
+                    } else if load == best_load && load < MAX_PER_CORE_LOAD {
+                        candidates.push(server_id);
                     }
                 }
 
+                let best = if candidates.is_empty() {
+                    best_err.map(|(server_id, _)| server_id)
+                } else {
+                    use rand::Rng;
+                    let chosen = candidates[rand::thread_rng().gen_range(0..candidates.len())];
+                    trace!(
+                        "Selected {:?} at random from {} servers at load {}",
+                        chosen,
+                        candidates.len(),
+                        best_load
+                    );
+                    Some(chosen)
+                };
+
                 // Assign the job to our best choice
-                if let Some((server_id, server_details)) = best.or(best_err) {
+                if let Some(server_id) = best {
+                    let server_details = servers
+                        .get_mut(&server_id)
+                        .expect("chosen server went missing from map");
                     let job_count = self.job_count.fetch_add(1, Ordering::SeqCst) as u64;
                     let job_id = JobId(job_count);
                     assert!(server_details.jobs_assigned.insert(job_id));
@@ -849,5 +858,135 @@ impl ServerIncoming for Server {
             .do_update_job_state(job_id, JobState::Complete)
             .context("Updating job state failed")?;
         res
+    }
+}
+
+#[cfg(test)]
+mod scheduler_load_balance_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::net::SocketAddr;
+
+    struct MockOutgoing;
+    impl SchedulerOutgoing for MockOutgoing {
+        fn do_assign_job(
+            &self,
+            _server_id: ServerId,
+            _job_id: JobId,
+            _tc: Toolchain,
+            _auth: String,
+        ) -> Result<AssignJobResult> {
+            Ok(AssignJobResult {
+                state: JobState::Ready,
+                need_toolchain: false,
+            })
+        }
+    }
+
+    struct NoopAuthorizer;
+    impl JobAuthorizer for NoopAuthorizer {
+        fn generate_token(&self, _job_id: JobId) -> Result<String> {
+            Ok("test-token".to_owned())
+        }
+        fn verify_token(&self, _job_id: JobId, _token: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn server_id(port: u16) -> ServerId {
+        ServerId::new(SocketAddr::from(([127, 0, 0, 1], port)))
+    }
+
+    fn register_servers(s: &Scheduler, n: u16, cpus: usize) {
+        for i in 0..n {
+            s.handle_heartbeat_server(
+                server_id(10501 + i),
+                ServerNonce::new(),
+                cpus,
+                Box::new(NoopAuthorizer),
+            )
+            .unwrap();
+        }
+    }
+
+    fn alloc(s: &Scheduler) -> (JobId, ServerId) {
+        match s
+            .handle_alloc_job(
+                &MockOutgoing,
+                Toolchain {
+                    archive_id: "tc".to_owned(),
+                },
+            )
+            .unwrap()
+        {
+            AllocJobResult::Success { job_alloc, .. } => (job_alloc.job_id, job_alloc.server_id),
+            AllocJobResult::Fail { msg } => panic!("alloc failed: {}", msg),
+        }
+    }
+
+    fn finish(s: &Scheduler, job: JobId, server: ServerId) {
+        s.handle_update_job_state(job, server, JobState::Started)
+            .unwrap();
+        s.handle_update_job_state(job, server, JobState::Complete)
+            .unwrap();
+    }
+
+    // A mostly-serial build (in-flight == 1: configure steps, dependency
+    // chains, the tail of every build). Every alloc sees an all-idle farm, so
+    // a fair tie-break must spread jobs; first-idle-wins gives one server
+    // everything.
+    #[test]
+    fn sequential_jobs_spread_across_idle_servers() {
+        let s = Scheduler::new();
+        register_servers(&s, 10, 4);
+        let mut counts: HashMap<ServerId, usize> = HashMap::new();
+        for _ in 0..200 {
+            let (job, srv) = alloc(&s);
+            *counts.entry(srv).or_default() += 1;
+            finish(&s, job, srv);
+        }
+        let max = counts.values().copied().max().unwrap();
+        assert!(
+            counts.len() >= 5,
+            "only {}/10 servers ever got a job: {:?}",
+            counts.len(),
+            counts
+        );
+        assert!(max <= 100, "one server got {}/200 jobs: {:?}", max, counts);
+    }
+
+    // A pipelined build whose parallelism (8) is below farm capacity (10
+    // servers x 4 cores): servers at the back of the scan order must still
+    // see a fair share of work.
+    #[test]
+    fn pipelined_jobs_do_not_starve_tail_servers() {
+        let s = Scheduler::new();
+        register_servers(&s, 10, 4);
+        let mut counts: HashMap<ServerId, usize> = HashMap::new();
+        let mut in_flight: VecDeque<(JobId, ServerId)> = VecDeque::new();
+        for _ in 0..500 {
+            let (job, srv) = alloc(&s);
+            *counts.entry(srv).or_default() += 1;
+            in_flight.push_back((job, srv));
+            if in_flight.len() >= 8 {
+                let (job, srv) = in_flight.pop_front().unwrap();
+                finish(&s, job, srv);
+            }
+        }
+        let max = counts.values().copied().max().unwrap();
+        let min = counts.values().copied().min().unwrap_or(0);
+        assert!(
+            counts.len() == 10,
+            "only {}/10 servers ever got a job: {:?}",
+            counts.len(),
+            counts
+        );
+        assert!(
+            max <= 3 * (500 / 10) && min >= 10,
+            "distribution too skewed (max {}, min {}): {:?}",
+            max,
+            min,
+            counts
+        );
     }
 }
